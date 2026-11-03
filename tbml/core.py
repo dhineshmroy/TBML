@@ -506,9 +506,9 @@ def _parse_one(raw: pd.DataFrame, regions, branches, month_key, source, bdue, rd
     found = _find_columns(raw.columns)
     vals_map = found["values"]
     missing = [f"{c} (Present)" for c in KRI_CODES if (c, "Present") not in vals_map]
-    has_extra = any(p != "Present" for (_, p) in vals_map)
-    if has_extra:
-        missing += [f"{c} ({p})" for c in KRI_CODES for p in ("Previous", "YTD") if (c, p) not in vals_map]
+    # Previous / YTD are worked out by the portal; any such columns in an old-style file are ignored.
+    vals_map = {k: v for k, v in vals_map.items() if k[1] == "Present"}
+    has_extra = False
     if missing:
         raise ValueError(f"{source}: could not find these indicator columns: " + ", ".join(missing[:8])
                          + (" ..." if len(missing) > 8 else "")
@@ -681,6 +681,50 @@ def _normalise_month_df(df: pd.DataFrame) -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 
+def derive_prev_ytd(records: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
+    """Fill the Previous-month and YTD columns from the PRESENT-month figures of the saved months.
+
+    Branches now report the present month only. For every saved month and branch:
+      Previous = the branch's Present figure of the calendar month before (0 if none saved,
+                 e.g. September 2026, the month before the first report).
+      YTD      = sum of the branch's Present figures from January to this month of the same
+                 calendar year (months with nothing saved, e.g. Jan-Sep 2026, count as 0).
+                 Balance indicators (YTD rule 'latest') use the present month's figure.
+    Recomputed every time, so a late or corrected month flows through to later months.
+    """
+    out = {}
+    keys = sorted(records)
+    for key in keys:
+        d = records[key].copy()
+        d = d.reset_index(drop=True)
+        yr = key[:4]
+        pk = prev_key(key)
+        prev_df = records.get(pk)
+        prev_map = {}
+        if prev_df is not None and not prev_df.empty:
+            prev_map = prev_df.drop_duplicates("Branch Code").set_index("Branch Code")
+        same_year = [k for k in keys if k[:4] == yr and k <= key]
+        for code in KRI_CODES:
+            pres = pd.to_numeric(d[code], errors="coerce")
+            if len(prev_map):
+                pv = d["Branch Code"].map(pd.to_numeric(prev_map[code], errors="coerce"))
+            else:
+                pv = pd.Series(np.nan, index=d.index)
+            d[num_col(code, "Previous")] = pv.fillna(0.0)
+            if IND_BY_CODE[code]["ytd"] == "latest":
+                d[num_col(code, "YTD")] = pres.fillna(0.0)
+            else:
+                tot = pres.fillna(0.0).copy()
+                for k in same_year:
+                    if k == key:
+                        continue
+                    o = records[k].drop_duplicates("Branch Code").set_index("Branch Code")
+                    tot = tot + d["Branch Code"].map(pd.to_numeric(o[code], errors="coerce")).fillna(0.0)
+                d[num_col(code, "YTD")] = tot
+        out[key] = d
+    return out
+
+
 def load_records() -> dict[str, pd.DataFrame]:
     if not cfg.RECORDS_FILE.exists():
         return {}
@@ -695,7 +739,7 @@ def load_records() -> dict[str, pd.DataFrame]:
             df = df[df["Region Code"].notna() | df["Branch Code"].notna()]
         df = df[df["Region Code"].astype(str).str.strip().str.upper() != "TOTAL"]
         out[key] = _normalise_month_df(df)
-    return dict(sorted(out.items()))
+    return derive_prev_ytd(dict(sorted(out.items())))
 
 
 def load_log() -> pd.DataFrame:
@@ -712,6 +756,7 @@ def load_log() -> pd.DataFrame:
 
 def save_records(records: dict[str, pd.DataFrame], log: pd.DataFrame) -> None:
     cfg.DATA_DIR.mkdir(parents=True, exist_ok=True)
+    records = derive_prev_ytd({k: _normalise_month_df(v) for k, v in records.items()})
     _backup(cfg.RECORDS_FILE)
     tmp = cfg.RECORDS_FILE.with_name(cfg.RECORDS_FILE.stem + ".tmp.xlsx")
     legend = pd.DataFrame([{"Code": i["code"], "Indicator": i["full"], "Unit": i["unit"]} for i in INDICATORS])
